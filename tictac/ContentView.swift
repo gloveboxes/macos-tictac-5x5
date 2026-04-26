@@ -268,9 +268,21 @@ struct ContentView: View {
         }
     }
 
+    // Maximum search depth (plies) for minimax look-ahead.
+    private static let searchDepth = 5
+
+    // Sentinel score representing a forced win/loss inside the search.
+    private static let winScore = 1_000_000
+
+    // Moves whose score is within this margin of the best are considered
+    // equally good and chosen randomly between, to add variety.
+    private static let moveTieMargin = 25
+
     private func bestComputerMove() -> Int? {
         let moves = availableMoves
+        guard !moves.isEmpty else { return nil }
 
+        // Fast paths: take an immediate win, or block an immediate loss.
         if let winningMove = firstWinningMove(for: Self.computerPlayer, in: moves) {
             return winningMove
         }
@@ -279,8 +291,188 @@ struct ContentView: View {
             return blockingMove
         }
 
-        return moves.max { firstMove, secondMove in
-            scoreComputerMove(firstMove) < scoreComputerMove(secondMove)
+        // Opening move on an empty board: pick randomly from a set of
+        // strong central squares so the computer doesn't always start the
+        // same way. Skipping the search here also keeps the first move snappy.
+        if moves.count == Self.boardSide * Self.boardSide {
+            let strongOpenings = [6, 7, 8, 11, 12, 13, 16, 17, 18] // inner 3×3
+            return strongOpenings.randomElement()
+        }
+
+        // Search with iterative ordering: rank candidates by the static heuristic
+        // first so alpha-beta prunes more aggressively.
+        let candidates = candidateMoves(on: board)
+            .sorted { scoreComputerMove($0) > scoreComputerMove($1) }
+
+        // Score every candidate with full minimax, then pick randomly among
+        // those within `moveTieMargin` of the best score.
+        var scoredMoves: [(move: Int, score: Int)] = []
+        scoredMoves.reserveCapacity(candidates.count)
+
+        var bestScore = Int.min
+        var alpha = Int.min
+        let beta = Int.max
+        var workingBoard = board
+
+        for move in candidates {
+            workingBoard[move] = Self.computerPlayer
+            let score = minimax(
+                board: &workingBoard,
+                depth: Self.searchDepth - 1,
+                alpha: alpha,
+                beta: beta,
+                maximizing: false
+            )
+            workingBoard[move] = nil
+
+            scoredMoves.append((move, score))
+            if score > bestScore { bestScore = score }
+            alpha = max(alpha, bestScore)
+        }
+
+        // If the best score is a forced win/loss, don't randomise — play it
+        // straight. Otherwise, pick uniformly at random from near-best moves.
+        if abs(bestScore) >= Self.winScore {
+            return scoredMoves.first(where: { $0.score == bestScore })?.move
+        }
+
+        let nearBest = scoredMoves.filter { bestScore - $0.score <= Self.moveTieMargin }
+        return nearBest.randomElement()?.move ?? scoredMoves.first?.move
+    }
+
+    /// Recursive minimax with alpha-beta pruning.
+    /// Positive scores favour the computer; negative scores favour the human.
+    private func minimax(
+        board: inout [Player?],
+        depth: Int,
+        alpha: Int,
+        beta: Int,
+        maximizing: Bool
+    ) -> Int {
+        // Terminal checks. Faster wins / slower losses are preferred via the depth bonus.
+        if winningLine(for: Self.computerPlayer, on: board) != nil {
+            return Self.winScore + depth
+        }
+        if winningLine(for: Self.humanPlayer, on: board) != nil {
+            return -Self.winScore - depth
+        }
+
+        let empties = board.indices.filter { board[$0] == nil }
+        if empties.isEmpty || depth == 0 {
+            return staticEvaluation(of: board)
+        }
+
+        let moves = candidateMoves(on: board)
+        var alpha = alpha
+        var beta = beta
+
+        if maximizing {
+            var best = Int.min
+            for move in moves {
+                board[move] = Self.computerPlayer
+                let score = minimax(board: &board, depth: depth - 1, alpha: alpha, beta: beta, maximizing: false)
+                board[move] = nil
+                if score > best { best = score }
+                if best > alpha { alpha = best }
+                if alpha >= beta { break }
+            }
+            return best
+        } else {
+            var best = Int.max
+            for move in moves {
+                board[move] = Self.humanPlayer
+                let score = minimax(board: &board, depth: depth - 1, alpha: alpha, beta: beta, maximizing: true)
+                board[move] = nil
+                if score < best { best = score }
+                if best < beta { beta = best }
+                if alpha >= beta { break }
+            }
+            return best
+        }
+    }
+
+    /// Restricts the branching factor by only considering empty cells within
+    /// one square (Chebyshev distance) of an occupied cell. Falls back to all
+    /// empties if the board is empty.
+    private func candidateMoves(on boardState: [Player?]) -> [Int] {
+        let empties = boardState.indices.filter { boardState[$0] == nil }
+        guard boardState.contains(where: { $0 != nil }) else { return empties }
+
+        var result: [Int] = []
+        result.reserveCapacity(empties.count)
+
+        for index in empties {
+            let row = index / Self.boardSide
+            let column = index % Self.boardSide
+            var hasNeighbour = false
+
+            outer: for rowOffset in -1...1 {
+                for columnOffset in -1...1 where rowOffset != 0 || columnOffset != 0 {
+                    let nearbyRow = row + rowOffset
+                    let nearbyColumn = column + columnOffset
+                    guard (0..<Self.boardSide).contains(nearbyRow),
+                          (0..<Self.boardSide).contains(nearbyColumn) else { continue }
+                    if boardState[self.index(row: nearbyRow, column: nearbyColumn)] != nil {
+                        hasNeighbour = true
+                        break outer
+                    }
+                }
+            }
+
+            if hasNeighbour { result.append(index) }
+        }
+
+        return result.isEmpty ? empties : result
+    }
+
+    /// Static evaluation: scans every 4-in-a-row window and scores it based on
+    /// how many of each player's marks it contains.
+    private func staticEvaluation(of boardState: [Player?]) -> Int {
+        let directions = [(row: 0, column: 1), (row: 1, column: 0), (row: 1, column: 1), (row: 1, column: -1)]
+        var score = 0
+
+        for row in 0..<Self.boardSide {
+            for column in 0..<Self.boardSide {
+                for direction in directions {
+                    let endRow = row + direction.row * (Self.winLength - 1)
+                    let endColumn = column + direction.column * (Self.winLength - 1)
+                    guard (0..<Self.boardSide).contains(endRow),
+                          (0..<Self.boardSide).contains(endColumn) else { continue }
+
+                    var computerCount = 0
+                    var humanCount = 0
+                    for offset in 0..<Self.winLength {
+                        let cellRow = row + direction.row * offset
+                        let cellColumn = column + direction.column * offset
+                        switch boardState[index(row: cellRow, column: cellColumn)] {
+                        case Self.computerPlayer?: computerCount += 1
+                        case Self.humanPlayer?: humanCount += 1
+                        default: break
+                        }
+                    }
+
+                    if computerCount > 0 && humanCount > 0 { continue }
+                    if computerCount > 0 {
+                        score += windowWeight(for: computerCount)
+                    } else if humanCount > 0 {
+                        // Defensive bias: weight opponent threats slightly higher
+                        // so the search prefers blocking over speculative attacks.
+                        score -= windowWeight(for: humanCount) * 5 / 4
+                    }
+                }
+            }
+        }
+
+        return score
+    }
+
+    private func windowWeight(for markCount: Int) -> Int {
+        switch markCount {
+        case 1: return 1
+        case 2: return 12
+        case 3: return 150
+        case 4: return 100_000
+        default: return 0
         }
     }
 
